@@ -1,0 +1,80 @@
+name: Create release to hrfp-test
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AKS_NAMESPACE: hrfp-test
+  AKS_CLIENT_ID: 6deb6172-cbe9-4af7-8007-9a3bbedd748c
+  AKS_TENANT_ID: c95a25de-f20a-4216-bc84-99694442c1b5
+  AKS_SUBSCRIPTION_ID: 829236e3-ffca-4a4f-84b0-56002a5e99e0
+  IMAGE_NAME: hrfp
+  APPLICATION_NAME: hrfp
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+    environment: Test
+    steps:
+    - name: Checkout code
+        uses: actions/checkout@v2
+     
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: '3.1.0' 
+
+      # Build the .NET application
+    - name: Build
+      run: dotnet build --configuration Release
+
+    - name: Azure registry login
+      uses: docker/login-action@v3
+      with:
+        registry: oneshopregistryprod.azurecr.io
+        username: oneshopregistryprod
+        password: ${{secrets.AZURE_IMAGE_REGISTRY}}
+
+    - name: Set image tag
+      id: image-tag
+      run: |
+        NEW_VERSION=$(echo "${GITHUB_REF}" | cut -d "/" -f3)
+        echo "New version: ${NEW_VERSION}"
+        echo "IMAGE_TAG=${NEW_VERSION}" >> $GITHUB_ENV
+
+    
+    - name: Get kubelogin
+      run: |
+        curl -LO https://github.com/Azure/kubelogin/releases/download/v0.0.20/kubelogin-linux-amd64.zip
+        sudo unzip -j kubelogin-linux-amd64.zip -d /usr/local/bin
+        rm -f kubelogin-linux-amd64.zip
+        kubelogin --version
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        client-id: ${{ env.AKS_CLIENT_ID }}
+        tenant-id: ${{ env.AKS_TENANT_ID }}
+        subscription-id: ${{ env.AKS_SUBSCRIPTION_ID }}
+        allow-no-subscriptions: true
+
+    - name: Set KUBECONFIG env variable
+      run: echo "KUBECONFIG=${RUNNER_TEMP}/kubeconfig-$(date +%s)" >> $GITHUB_ENV
+
+    - name: Set AKS cluster context
+      run: |
+          az account show
+          az aks get-credentials --subscription "${{ env.AKS_SUBSCRIPTION_ID }}" --resource-group "managed-aks-non-prod" --name "managednonprod" -f ${KUBECONFIG}
+          kubelogin convert-kubeconfig -l azurecli  # this is required for me because of AAD and Azure RBAC integration
+
+    - name: Helm Deploy Application
+      run: |
+        helm upgrade --install ${{ env.APPLICATION_NAME }} --debug --set replicaCount="2" --set configserver="http://configserver:8080" --set environment="test" --set profiles="hrfp-test" --set subDomain="hrfp" --set image.tag="${{ env.IMAGE_TAG }}" --namespace=${{env.AKS_NAMESPACE}} --values helm/values.yaml helm
